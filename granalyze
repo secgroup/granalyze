@@ -1,0 +1,1489 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+"""
+Security analyser for Grsecurity RBAC policies.
+
+Given a Grsecurity RBAC policy file, granalyze builds an abstract
+representation of the policy amenable for model checking.
+
+"""
+
+import os
+import re
+import sys
+import pwd
+import glob
+import stat
+import array
+import pickle
+import logging
+import fnmatch
+import argparse
+
+try:
+    import ply.lex as lex
+    import ply.yacc as yacc
+except ImportError:
+    sys.stderr.write("module ply not found, aborting.")
+    sys.exit(1)
+
+
+__authors__     = ["Marco Squarcina <msquarci at dais.unive.it>",
+                   "Riccardo Focardi <focardi at dais.unive.it>",
+                   "Stefano Calzavara <calzavara at dais.unive.it>"]
+__license__     =  "MIT"
+__copyright__   =  "Copyright 2014, University of Venice"
+__status__      =  "Development"
+__version__     =  "0.1"
+
+
+# global variables
+
+policy = None
+filesystem = None
+args = None
+
+protected_paths = {
+    '/etc/ssh', '/proc/kcore', '/proc/sys', '/proc/bus', '/proc/slabinfo',
+    '/proc/modules', '/proc/kallsyms', '/etc/shadow', '/var/backups', 
+    '/etc/shadow-', '/etc/gshadow', '/etc/gshadow-', '/var/log', '/dev/mem',
+    '/dev/kmem', '/dev/port', '/dev/log', '/sys', '/etc/ppp',
+    '/etc/samba/smbpasswd'
+}
+trusted_apps = {
+    '/bin/passwd', '/usr/sbin/sshd', '/bin/su'
+}
+
+
+# class definitions
+
+class Rule:
+    def __init__(self, rule):
+        # textual representation of the given rule, as provided by the user
+        self.rule = rule
+
+    def verify(self):
+        '''Parse the current rule and call the proper functions to verify it.'''
+
+        rule = self.rule.split()
+        try:
+            # simple eventual access rule
+            if rule[0] in ['!r', '!x', '!w']:
+                states = self._get_states(rule[1])
+                paths = self._get_paths(rule[2])
+                mode = rule[0][1]
+                self._eventual_access(states, paths, mode)
+            elif rule[0] == '!wx':
+                if len(rule) != 2:
+                    raise Rule.InvalidRule
+                states = self._get_states(rule[1])
+                self._wx_access(states)
+            else:
+                raise Rule.InvalidRule
+        except IndexError:
+            raise Rule.InvalidRule
+
+    def _get_states(self, triple):
+        '''Returns the set of states matching the triple string in the form of
+        <role>:<type>:<path>, e.g. lavish:u:/.'''
+
+        role = None
+        states = set()
+
+        [id_name, id_type, path] = triple.split(':')
+
+        try:
+            if id_type == 'u':
+                role = policy.roles_u[id_name]
+                role_triple = (role, role, policy.role_e)
+            elif id_type == 'g':
+                role = policy.roles_g[id_name]
+                role_triple = (role, policy.role_e, role)
+            elif id_type == 's':
+                role = policy.role_s[id_name]
+                role_triple = (role, policy.role_e, policy.role_e)
+            elif id_type == 'd':
+                role = policy.role_d
+                role_triple = (role, policy.role_e, policy.role_e)
+            else:
+                logging.error(("Invalid identity type '{}', should be one of 'u', "
+                               "'g', 's'".format(id_type)))
+        except KeyError:
+            logging.error("Invalid role '{}'".format(id_name))
+            raise Rule.InvalidRule
+
+        # if no paths are provided, check them all
+        if path != '':
+            path = Path(path)
+            eff_path = path.match_subj(role)
+
+        # populate the set of states 
+        for state in policy.states:
+            if state.role == role:
+                if not args.fullstart:
+                    if state.get_tuple()[:3] != role_triple:
+                        continue
+                if eff_path:
+                    if state.path_s == eff_path:
+                        states.add(state)
+                else:
+                    states.add(state)
+
+        return states
+
+    def _get_paths(self, path_sequence):
+        '''Returns the set of Path instances given a sequence of paths
+        separated by ;, e.g. /mnt/usb;/etc/nginx.'''
+
+        paths = set()
+        for path in path_sequence.split(';'):
+            paths.add(Path(path))
+
+        return paths
+
+    def _eventual_access(self, starts, paths, mode):
+        holds = True
+
+        for state_from in starts:
+            for path in paths:
+                state_to = state_from.eventual_access(path, mode)
+                if state_to:
+                    holds = False
+                    logging.info(("Starting from '{}' the path '{}' can be accessed with mode '{}' at "
+                          "'{}'").format(state_from, path, mode, state_to))
+                    if args.traces:
+                        trace = policy.find_trace(state_from.get_tuple(), state_to.get_tuple())
+                        warn("Trace from {}".format(policy.get_printable_trace(trace)))
+
+        self._print_status(holds)
+                   
+    def _wx_access(self, starts):
+        # key: path to a writable object, value: set of states where it's
+        # possible to write the given object
+        writable_objs = {}
+        holds = True
+
+        # populate the writable_objs dictionary
+        for state_from in starts:
+            for state_to in state_from.reachable_states():
+                for obj in policy.objects:
+                    if state_to.access(obj, 'w'):
+                        try:
+                            writable_objs[obj].add(state_to)
+                        except KeyError:
+                            writable_objs[obj] = {state_to}
+
+        # for each obj which is writable starting from the set of starts
+        # states, check if there's a reachable state that allows the execution
+        # of such object
+        for state_from in starts:
+            for state_to in state_from.reachable_states():
+                for obj, states_w in writable_objs.iteritems():
+                    if state_to.access(obj, 'x'):
+                        holds = False
+                        logging.info(("Starting from '{}' the path '{}' can be "
+                                      "both written and executed").format(state_from, obj))
+                        if args.traces:
+                            for state_w in states_w:
+                                trace_w = policy.find_trace(state_from.get_tuple(), state_w.get_tuple())
+                                warn("Trace for writing from {}".format(policy.get_printable_trace(trace_w)))
+                            trace_x = policy.find_trace(state_from.get_tuple(), state_to.get_tuple())
+                            warn("Trace for executing from {}".format(policy.get_printable_trace(trace_x)))
+
+        self._print_status(holds)
+
+    def _print_status(self, holds):
+        if holds:
+            notice("The provided rule holds")
+        else:
+            warn("The provided rule does NOT hold")
+
+    def __str__(self):
+        return self.rule
+
+    class InvalidRule(Exception):
+        pass
+ 
+class Filesystem:
+    def __init__(self, root = '/'):
+        self.root = root
+
+        # key: pathname of the setuid/gid file, value: owner
+        self.suid = {}
+        self.sgid = {}
+
+        self._find_suid_sgid()
+
+    def _find_suid_sgid(self):
+        '''Scan the filesystem for files having the set user and group id
+        bit and populate the suid and sgid dictionaries storing the pathname
+        and the user/group that owns the file.'''
+
+        for root, dirs, files in os.walk(self.root):
+            for name in files:
+                try:
+                    pathname = os.path.join(root, name)
+                    st = os.stat(pathname)
+                    md = st.st_mode
+                    # check if the file is set-uid
+                    if md & stat.S_ISUID:
+                        user = pwd.getpwuid(st.st_uid).pw_name
+                        self.suid[pathname] = user
+                        logging.info("Found {} to be set-uid {}".format(pathname, user))
+                    # check if the file is set-gid
+                    if md & stat.S_ISGID:
+                        group = pwd.getpwgid(st.st_gid).pw_name
+                        self.sgid[pathname] = group
+                        logging.info("Found {} to be set-gid {}".format(pathname, group))
+                except:
+                    pass
+
+class Policy:
+    def __init__(self, roles):
+        # list of all roles
+        self.roles = roles
+        # sets of special, user, group roles
+        # (key: role name, value Role instance)
+        self.roles_s = {}
+        self.roles_u = {}
+        self.roles_g = {}
+        # default role
+        self.role_d = None
+        # empty role (previously known as dontcare)
+        self.role_e = Role('_', set(), set(), [])
+        # set of the paths of all subjects
+        self.subjects = set()
+        # set of the paths of all objects
+        self.objects = set()
+        # special roles which can be impersonated by a given role
+        self.role_trans = {}
+        # user identities which can be assumed by a subject running on
+        # behalf of a given role (key: tuple (role instance, path), value: set
+        # of role instances)
+        self.usr_trans = {}
+        # group identities which can be assumed by a subject running on
+        # behalf of a given role (key/value same as usr_trans)
+        self.grp_trans = {}
+        # set of capabilities allowed by the policy given a role, subject path
+        self.caps = {}
+        # set of permissions granted by the policy given a role, subject path,
+        # object path triple
+        self.perms = {}
+        # abstract representation of set-uid/set-gid files found in the
+        # filesystem. Given a triple of role, subject path, object path, these
+        # dictionaries return the set of abstract users/groups that own the
+        # object (which is the best match for a set-uid/set-gid file)
+        self.suid = {}
+        self.sgid = {}
+        # representation of the policy Abstract LTS
+        self.lts = {}
+        # given the total number of states (n), the closure is a n x n
+        # adjacency matrix representing the transitive closure of the graph
+        # inferred from the abstract LTS. If closure[i][j] == True, it means
+        # that the state j is reachable by state i in one or more steps.
+        self.closure = None
+        # this list is useful if one needs to retrieve the state given its
+        # index (we store the tuples here, not the actual State instances)
+        self.states = []
+        # the trusted computing base for the system with respect to the
+        # secified security invariants. This set is filled with subjects of
+        # states marked as high
+        self.tcb = set()
+
+    def abstract_user(self, user):
+        try:
+            return self.roles_u[user]
+        except KeyError:
+            for role in self.roles_u.itervalues():
+                if user in role.ids:
+                    return role
+            return self.role_e
+
+    def abstract_group(self, group):
+        try:
+            return self.roles_g[group]
+        except KeyError:
+            for role in self.roles_g.itervalues():
+                if group in role.ids:
+                    return role
+            return self.role_e
+
+    def compute_relations(self):
+        # remove administrative roles if needed
+        if not args.admin:
+            policy.roles = [r for r in policy.roles if 'A' not in r.flags]
+
+        # compute the lists of special, user, group roles. Domains are treated
+        # as normal roles, i.e. a user role can't be named as a user domain
+        # role (as in grsecurity)
+        for role in self.roles:
+            if 's' in role.flags:
+                self.roles_s[role.name] = role
+            elif 'u' in role.flags:
+                self.roles_u[role.name] = role
+            elif 'g' in role.flags:
+                self.roles_g[role.name] = role
+            else:
+                self.role_d = role
+
+        for role in self.roles:
+            # compute transitions to special roles. KeyError exceptions are
+            # raised mostly due to the removed set of administrative roles
+            self.role_trans[role] = set()
+            for r_s in role.role_transitions:
+                try:
+                    self.role_trans[role] |= {self.roles_s[r_s]}
+                except KeyError:
+                    pass
+
+            for sbj in role.subjects:
+                # compute the set of all possible subjects
+                self.subjects.add(sbj.paths)
+
+                # compute users transitions
+                users = set(self.roles_u.values()) | {self.role_e}
+                if sbj.user_transition_allow:
+                    # domains: easy to put in...
+                    users = {self.abstract_user(u) for u in sbj.user_transition_allow}
+                elif sbj.user_transition_deny:
+                    # domains: ...difficult to throw away :)
+                    denied_roles = {}
+                    for user in sbj.user_transition_deny:
+                        role_u = self.abstract_user(user)
+                        try:
+                            denied_roles[role_u] |= {user}
+                        except KeyError:
+                            denied_roles[role_u] = {user}
+                    for role_u, ids in denied_roles.iteritems():
+                        if role_u.ids == ids:
+                            # throw away the current domain if it's forbidden
+                            # to perform a transition to all the users
+                            # associated with the domain 
+                            users.discard(role_u)
+                self.usr_trans[(role, sbj.paths)] = users
+
+                # compute groups transitions
+                groups = set(self.roles_g.values()) | {self.role_e}
+                if sbj.group_transition_allow:
+                    groups = {self.abstract_group(g) for g in sbj.group_transition_allow}
+                elif sbj.group_transition_deny:
+                    denied_roles = {}
+                    for group in sbj.group_transition_deny:
+                        role_g = self.abstract_group(group)
+                        try:
+                            denied_roles[role_g] |= {group}
+                        except KeyError:
+                            denied_roles[role_g] = {group}
+                    for role_g, ids in denied_roles.iteritems():
+                        if role_g.ids == ids:
+                            groups.discard(role_g)
+                self.grp_trans[(role, sbj.paths)] = groups
+
+                # compute permissions
+                for obj in sbj.objects:
+                    self.objects |= {obj.path}
+                    #print("{} | {}".format(obj, type(obj)))
+                    self.perms[(role, sbj.paths, obj.path)] = obj.modes
+
+    def compute_inheritance(self):
+        '''Compute subject permissions and capabilities with respect to
+        inheritance.'''
+
+        for role in self.roles:
+            sbj_sorted = sorted(role.subjects, key=lambda s: s.paths, reverse=True)
+            for i in range(len(sbj_sorted)):
+                sbj = sbj_sorted[i]
+                if 'o' not in sbj.modes and '/' != sbj.paths.name:
+                    # find the parent of subj (the lest upper bound) by going backwards
+                    j = i-1
+                    while j > 0:
+                        if sbj.paths < sbj_sorted[j].paths:
+                            break
+                        j -= 1
+                    sbj_parent = sbj_sorted[j]
+                    perms_keys = self.perms.keys()
+                    # copy the permissions from parent to child by copying each
+                    # object not defined in the current subject that is found
+                    # in its parent
+                    for p in perms_keys:
+                        if p[0] == role and p[1] == sbj_parent.paths \
+                        and (p[0], sbj.paths, p[2]) not in perms_keys:
+                            self.perms[(p[0], sbj.paths, p[2])] = self.perms[p]
+                    # inherit also capabilities from parent to current subject
+                    sbj.caps = sbj_parent.caps + sbj.caps
+                # compute the effective set of capabilities for inheriting and
+                # non-inheriting subjects
+                self.caps[(role, sbj.paths)] = self._get_caps(sbj.caps)
+
+    def compute_fs_abstraction(self):
+        '''Compute the interplay with the filesystem with respect to the policy
+        by translating the list of set-uid/set-gid pathname, user/group pairs
+        into sets of their abstract counterpart (object path, abstract
+        user/group).'''
+        
+        # consider only role, subject pairs as found in the policy
+        for role in self.roles:
+            for sbj in role.subjects:
+                path_s = sbj.paths
+                for pathname, user in filesystem.suid.iteritems():
+                    obj = Path(pathname).match_obj(role, path_s)
+                    a_user = self.abstract_user(user)
+                    try:
+                        self.suid[(role, path_s, obj)] |= {a_user}
+                    except KeyError:
+                        self.suid[(role, path_s, obj)] = {a_user}
+                for pathname, group in filesystem.sgid.iteritems():
+                    obj = Path(pathname).match_obj(role, path_s)
+                    a_group = policy.abstract_group(group)
+                    try:
+                        self.sgid[(role, path_s, obj)] |= {a_group}
+                    except KeyError:
+                        self.sgid[(role, path_s, obj)] = {a_group}
+
+    def compute_lts(self):
+        # compute all the possible states and, for each state, all the possible
+        # 1-step transitions
+        for r in self.roles + [self.role_d]:
+            for r_u in self.roles_u.values() + [self.role_e]:
+                for r_g in self.roles_g.values() + [self.role_e]:
+                    for sbj in self.subjects:
+                        state = (r, r_u, r_g, sbj)
+                        self.lts[state] = State(*state)
+
+    def compute_closure(self):
+        '''Computes the transitive closure on the LTS.'''
+
+        logging.info('Assigning indexes to each state')
+        # set in index to each state
+        i = 0
+        for state in self.lts.itervalues():
+            state.idx = i
+            self.states.append(state)
+            i += 1
+
+        # number of states
+        n = i
+
+        logging.info('Computing the adjacency matrix')
+        # get the adjacency matrix and remove unwanted transitions from the LTS
+        self.closure = [array.array('B', [0 for _ in range(n)]) for _ in range(n)]
+        for state_from, state_from_obj in self.lts.iteritems():
+            allowed_transitions = {}
+            for state_to, actions in state_from_obj.transitions.iteritems():
+                # avoid storing loops
+                if state_from == state_to:
+                    continue
+                state_to_obj = self.lts[state_to]
+                allowed_actions = set()
+                for action in actions:
+                    logging.debug('{} -{}-> {}'.format(state_from_obj,
+                                                       action,
+                                                       state_to_obj))
+                    # here we can enforce some constraints of the transition
+                    if not args.auth:
+                        # keep only transitions to special roles that do not
+                        # require authentication
+                        if action.rule == 'set_r':
+                            role = action.argument
+                            if (role != self.role_d) and ('N' not in role.flags):
+                                logging.debug('filtering out transitions to {} performed under action {}'.format(state_to_obj, action))
+                                continue
+                    self.closure[state_from_obj.idx][state_to_obj.idx] = 1
+                    allowed_actions.add(action)
+                if allowed_actions:
+                    allowed_transitions[state_to] = allowed_actions
+            state_from_obj.transitions = allowed_transitions
+
+        logging.info('Computing the transitive closure')
+        # apply the optimized Warshall algorithm for computing the transitive closure in
+        # O(n^3) time (at most n^2 + n^3 comparisons)
+        for k in range(n):
+            for i in range(n):
+                if self.closure[i][k]:
+                    for j in range(n):
+                        self.closure[i][j] = self.closure[i][j] or self.closure[k][j]
+
+
+    def find_trace(self, start, end):
+        '''Find the shortest path from start to end using breadth-first
+        search.'''
+
+        # maintain a queue of paths
+        queue = []
+        # push the first path into the queue
+        queue.append([(start, None)])
+        while queue:
+            # get the first path from the queue
+            path = queue.pop(0)
+            # get the last node from the path
+            (node, act) = path[-1]
+            # path found
+            if str(self.lts[node]) == str(self.lts[end]):
+                return path
+            # enumerate all adjacent nodes, construct a new path and push it into the queue
+            for adjacent, acts in self.lts[node].transitions.iteritems():
+                new_path = list(path)
+                new_path.append((adjacent, list(acts)[0]))
+                queue.append(new_path)
+
+    def get_printable_trace(self, trace):
+        trace_text = ''
+
+        for t in trace:
+            if t[1]:
+                trace_text += "\n    --{}--> ".format(t[1])
+            trace_text += "{}".format(policy.lts[t[0]])
+
+        return trace_text
+
+    def automatic_analysis(self, show_transitions = False):
+        '''Perform an automatic analysis of the policy by splitting the
+        states into two partitions (High and Low) depending on the access
+        permissions to sensitive files. If it's possible to perform transitions
+        from a Low state to an High one, a warning is raised.'''
+
+        # set labels (High, Low) and print states marked as H
+        notice("The following states have been marked as HIGH:")
+        for state in policy.states:
+            state.label = 0
+            for path in protected_paths:
+                if state.access(path, 'r'):
+                    # if the actual subject is able to access a protected
+                    # resource, add the subject to the TCB of the system
+                    self.tcb |= {state.path_s_eff}
+                    # if the subject is one of the protected path, mark it as
+                    # -1 and go on, otherwise raise a warning and mark the
+                    # state as high
+                    if state.path_s_eff in trusted_apps:
+                        state.label = -1
+                    else:
+                        print("    {} (allowed to read '{}')".format(state, path))
+                        state.label = 1
+                    # we don't need to iterate through the whole list of
+                    # protected paths here. If the current subject is allowed
+                    # to access just a single protected resource, it's enough
+                    # to mark it as high
+                    break
+
+        # print the TCB
+        notice("The following TCB has been computed:")
+        for path in self.tcb:
+            print("    {}".format(path.name))
+
+        # check if there are transitions from LOW (0) to HIGH (1)
+        if show_transitions:
+            notice("The following eventually unsafe transitions have been detected:")
+        n = len(policy.states)
+        n_trans = 0
+        for i in range(n):
+            for j in range(n):
+                if policy.closure[i][j]:
+                    if policy.states[i].label == 0 and policy.states[j].label == 1:
+                        n_trans += 1
+                        if show_transitions:
+                            warn("'{}' --> '{}'".format(policy.states[i], policy.states[j]))
+                            if args.traces:
+                                trace = policy.find_trace(policy.states[i].get_tuple(), policy.states[j].get_tuple())
+                                print("    Trace from {}".format(policy.get_printable_trace(trace)))
+        notice("Total number of eventually unsafe transitions: {}".format(n_trans))
+
+
+    def _get_caps(self, caps):
+        '''Return the effective set of capabilities given a list of raw
+        capabilities as defined in the policy.'''
+
+        effective_caps = set(['setuid', 'setgid'])
+        for cap in caps:
+            if cap == '+CAP_ALL':
+                effective_caps = set(['setuid', 'setgid'])
+            elif cap == '-CAP_ALL':
+                effective_caps = set()
+            elif cap.startswith('+'):
+                effective_caps.add(cap[5:].lower())
+            elif cap.startswith('-'):
+                effective_caps.discard(cap[5:].lower())
+        return effective_caps
+
+    def __str__(self):
+        return '\n\n'.join(str(r) for r in self.roles) \
+             + '\n\nsubjects: {}'.format([s.name for s in self.subjects]) \
+             + '\n\nlts: {}'.format([n for n in self.lts]) \
+             + '\n\nroles: \n{}'.format('\n'.join(str((r.name, r.flags)) for r in self.roles)) \
+             + '\n\nlen lts: {}'.format(len(self.lts)) \
+             + '\n\nlen subjects: {}'.format(len(self.subjects)) \
+             + '\n\nlts: {}'.format('\n'.join(str(k) for k in self.lts.keys()))
+             #+ '\n\ntransitions: {}'.format(self.transitions)
+
+class State:
+    def __init__(self, role, role_u, role_g, path_s):
+        self.role = role
+        self.role_u = role_u
+        self.role_g = role_g
+        self.path_s = path_s
+
+        # get the effective pathname for the subject under the current state
+        self.path_s_eff = self.path_s.match_subj(self.role)
+
+        # list of 1-step transitions to other abstract states. Each element of
+        # this list is a pair made of a 4-tuple (role_s, role_u, role_g,
+        # path_s) and an Action instance
+        self.transitions = {}
+
+        # numerical index for easy access 
+        self.idx = 0
+
+        # security label, start at the bottom of the lattice (0)
+        self.label = 0
+
+        self._compute_transitions()
+
+    def _get_role(self, role, role_u, role_g):
+        '''Returns the actual role according to the RBAC role hierarchy.'''
+
+        if 's' in role.flags:
+            return role
+        if role_u != policy.role_e:
+            return role_u
+        if role_g != policy.role_e and role != policy.role_e:
+            return role_g
+        # the default role is applied when no special, user or group roles can
+        # be granted
+        return policy.role_d
+
+    def _compute_transitions(self):
+
+        def add_transition(state, action):
+            try:
+                self.transitions[state] |= {action}
+            except KeyError:
+                self.transitions[state] = {action}
+        
+        # set_r
+        for role_s in policy.role_trans[self.role] | {policy.role_e}:
+            role = self._get_role(role_s, self.role_u, self.role_g)
+            state = (role, self.role_u, self.role_g, self.path_s)
+            add_transition(state, Action('set_r', role_s))
+        # set_u
+        if 'setuid' in policy.caps[(self.role, self.path_s_eff)]:
+            for role_u in policy.usr_trans[(self.role, self.path_s_eff)]:
+                role = self._get_role(self.role, role_u, self.role_g)
+                state = (role, role_u, self.role_g, self.path_s)
+                add_transition(state, Action('set_u', role_u))
+        # set_g
+        if 'setgid' in policy.caps[(self.role, self.path_s_eff)]:
+            for role_g in policy.grp_trans[(self.role, self.path_s_eff)]:
+                role = self._get_role(self.role, self.role_u, role_g)
+                state = (role, self.role_u, role_g, self.path_s)
+                add_transition(state, Action('set_g', role_g))
+        # exec
+        for s, p in policy.perms.iteritems():
+            # get the permissions of the current role/subject
+            if s[0] == self.role and s[1] == self.path_s_eff and ('x' in p) and ('h' not in p):
+                path_o = s[2]
+                paths_s_new = path_o.img(self.role, self.path_s_eff)
+
+                # if we assume there are no setuid/setgid files in the
+                # filesystem we can just copy the user/group found in the
+                # current state. This is the default (and best possible) case
+                roles_u = {self.role_u}
+                roles_g = {self.role_g}
+                # if the current object has the 'm' flag, creation of
+                # setuid/setgid files/directories and modification of
+                # files/directories to be setuid/setgid is allowed: hence we
+                # unfold all the transitions to the possible users/groups that
+                # the current subject is allowed to impersonate. We do the same
+                # if the option -f all is provided (worst possible case)
+                if 'm' in p or args.fs == 'all':
+                    roles_u |= policy.usr_trans[(self.role, self.path_s_eff)]
+                    roles_g |= policy.grp_trans[(self.role, self.path_s_eff)]
+                # if we scanned the filesystem looking for set-uid/set-gid
+                # files, we can reduce the number of transitions to the
+                # possible users/groups
+                elif filesystem:
+                    # set-uid files
+                    try:
+                        users = policy.suid[(self.role, self.path_s_eff, path_o)]
+                        allowed_users = policy.usr_trans[(self.role, self.path_s_eff)]
+                        roles_u |= {u for u in users if u in allowed_users}
+                    except KeyError:
+    					pass
+                    # set-gid files
+                    try:
+                        groups = policy.sgid[(self.role, self.path_s_eff, path_o)]
+                        allowed_groups = policy.grp_trans[(self.role, self.path_s_eff)]
+                        roles_g |= {g for g in groups if g in allowed_groups}
+                    except KeyError:
+    					pass
+                # with roles_u and roles_g sets computed we can unfold the
+                # transitions performed by exec
+                for role_u in roles_u:
+                    for role_g in roles_g:
+                        for path_s_new in paths_s_new:
+                            state = (self.role, role_u, role_g, path_s_new)
+                            add_transition(state, Action('exec', path_s_new))
+
+    def access(self, path, mode):
+        '''Return True if the given path is readable, writable or executable
+        (depending on the provided mode) in the current state.'''
+
+        assert mode in ['r', 'w', 'x']
+
+        perms = policy.perms[(self.role, self.path_s_eff, path.match_obj(self.role, self.path_s_eff))]
+        return (mode in perms) and ('h' not in perms)
+
+    def eventual_access(self, path, mode):
+        '''Return a state where the given path is readable, writable or
+        executable (depending on the provided mode) starting from the current
+        state. None is such state is not found.'''
+
+        assert mode in ['r', 'w', 'x']
+
+        for i in range(len(policy.states)):
+            if policy.closure[self.idx][i]:
+                if policy.states[i].access(path, mode):
+                    return policy.states[i]
+        return None
+
+    def reachable_states(self):
+        '''Return the set of reachable states in one or more transitions
+        starting from the current one.'''
+
+        reachable_states = set()
+        for i in range(len(policy.states)):
+            if policy.closure[self.idx][i]:
+                reachable_states.add(policy.states[i])
+        return reachable_states
+
+    def get_tuple(self):
+        return (self.role, self.role_u, self.role_g, self.path_s)
+
+    def __hash__(self):
+        return hash((self.role, self.role_u, self.role_g, self.path_s))
+
+    def __eq__(self, other):
+        return self.role == other.role and self.role_u == other.role_u \
+        and self.role_g == other.role_g and self.path_s == other.path_s
+
+    def __str__(self):
+        return "{}:{}:{} ({}, {})".format(self.role.name, self.role.role_type,
+                                          self.path_s_eff.name,
+                                          self.role_u.name, self.role_g.name)
+
+class Action:
+    def __init__(self, rule, argument):
+        self.rule = rule
+        self.argument = argument
+
+    def __str__(self):
+        return "{}({})".format(self.rule, self.argument.name)
+
+class Path:
+    def __init__(self, name):
+        self.name = name
+
+    def match_subj(self, role):
+        '''Given the current pathname (self), return the pathname of the
+        matching subject for self in the given role.'''
+        
+        # having defined __lt__ we are allowed to use min(), pretty cool!
+        return min(p[1] for p in policy.perms.keys() if p[0] == role and self < p[1])
+
+    def match_obj(self, role, path_s):
+        '''Given the current pathname (self), return the pathname of the
+        matching object for self in the given role under the subject having
+        path_s as a path.'''
+
+        return min(p[2] for p in policy.perms.keys() if p[0] == role and p[1] == path_s and self < p[2])
+
+    def img(self, role, path_s):
+        '''Return the set of possible subjects that may be impersonated upon
+        execution of the object o (self) in the given role under the subject
+        path_s. This set is made of all the subjects more specific than the
+        object o (self) and for which o is the best match in (r,s) plus the
+        least upper bound of o. The idea is that we could be executing all of
+        these subjects when executing o.'''
+
+        # the upper-bound for the new subject is the most specific subject
+        # which is no more specific than the current path (self).
+        upper_bound = min(p for p in policy.subjects if self < p)
+
+        # every subject no more generic than the current path (self) is a
+        # possible match, but we filter out all the subjects which would be
+        # associated to the execution of a more specific object.
+        more_specific = {p for p in policy.subjects if p < self and p.match_obj(role, path_s) == self}
+
+        return more_specific | {upper_bound}
+
+    def __lt__(self, other):
+        '''Return true if self is smaller or equal than other, e.g. 
+        /usr/bin/cat <= /usr/bin. Other may contain wildcards. Note that the
+        trailing / is interpreted as as a directory, thus /usr/bin/cat does not
+        match /usr/bin/cat/.'''
+        
+        def path_split(path_name):
+            return [''] if path_name == '/' else path_name.split('/')
+
+        dirs_self = path_split(self.name)
+        dirs_other = path_split(other.name)
+        if len(dirs_self) < len(dirs_other):
+            return False
+        for i in range(len(dirs_other)):
+            if not fnmatch.fnmatchcase(dirs_self[i], dirs_other[i]):
+                return False
+        return True
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return self.name == other.name
+
+    def __str__(self):
+        return self.name
+
+class Role:
+    def __init__(self, name, flags, role_transitions, subjects, ids = {}):
+        self.name = name
+        # flags s, u, g, d are mutually exclusive
+        self.flags = flags
+        self.role_transitions = role_transitions
+        self.subjects = subjects
+        self.ids = ids
+        
+        try:
+            self.role_type = (flags & {'u', 'g', 's'}).pop()
+        except KeyError:
+            self.role_type = 'd'
+
+    def __hash__(self):
+        return hash((self.name, str(self.flags)))
+
+    def __eq__(self, other):
+        return self.name == other.name and self.flags == other.flags
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __str__(self):
+        s  = "role: {}, flags: {}, ids: {}".format(self.name, self.flags, self.ids)
+        return s
+
+class Subject:
+    def __init__(self, paths, modes, user_transition_allow,
+                 user_transition_deny, group_transition_allow,
+                 group_transition_deny, objects, caps):
+
+        self.paths = paths
+        self.modes = modes
+        self.user_transition_allow = user_transition_allow
+        self.user_transition_deny = user_transition_deny
+        self.group_transition_allow = group_transition_allow
+        self.group_transition_deny = group_transition_deny
+        self.objects = objects
+        self.caps = caps
+
+    def __str__(self):
+        s  = "\n    subject: {}, modes: {}\n".format(self.paths, self.modes)
+        s += "    user_transition_allow: {}, user_transition_deny: {}\n".format(self.user_transition_allow, self.user_transition_deny)
+        s += "    group_transition_allow: {}, group_transition_deny: {}\n".format(self.group_transition_allow, self.group_transition_deny)
+        #s += '\n'.join(str(o) for o in self.objects)
+        s += '\n    caps: {}'.format(self.caps)
+
+        return s
+
+class Obj:
+    def __init__(self, path, modes):
+        self.path = path
+        self.modes = modes
+
+    def image(self, role, sbj):
+        pass
+
+    def __str__(self):
+        return "        object: {} {}".format(self.path, self.modes)
+
+class Parser:
+    """
+    RBAC policy parser.
+    """
+
+    reserved = {
+        'role': 'ROLE',
+        'role_allow_ip': 'ROLE_ALLOW_IP',
+        'role_transitions': 'ROLE_TRANSITIONS',
+        'role_umask': 'ROLE_UMASK',
+        'domain': 'DOMAIN',
+        'subject': 'SUBJECT',
+        'user_transition_allow': 'USER_TRANSITION_ALLOW',
+        'user_transition_deny': 'USER_TRANSITION_DENY',
+        'group_transition_allow': 'GROUP_TRANSITION_ALLOW',
+        'group_transition_deny': 'GROUP_TRANSITION_DENY',
+        'connect_reserved': 'CONNECT',
+        'bind_reserved': 'BIND',
+        'ip_override': 'IP_OVERRIDE',
+        'disabled': 'DISABLED',
+        'sock_allow_family': 'SOCK_ALLOW_FAMILY'
+    }
+
+    # List of token names
+    tokens = [
+        'CAPABILITY',
+        'RESOURCE',
+        'PAX_FLAG',
+        'LIMIT',
+        'IP_ADDRESS',
+        'OPATH',
+        'PORT',
+        'UMASK',
+        'ID'                # default in case the reserved word does not match
+    ] + list(reserved.values())
+
+    literals = ['-', '+', '{', '}', ':', '.']
+
+    # regular expression rules for simple tokens
+    t_LIMIT = r'[0-9]+[a-zA-Z]?'
+    t_IP_ADDRESS = r'[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+    t_OPATH = r'(/[\w\.\*\?\-\+\_\[\]\(\)~]*)+'
+    t_PORT = r':[0-9]+(\-[0-9]+)?'
+    t_UMASK = r'[0-7]{3}'
+
+    t_ignore = ' \t'
+
+    def __init__(self, **kwargs):
+        self.lexer = lex.lex(module = self, **kwargs)
+        yacc.yacc(module = self, **kwargs)
+
+    def __call__(self, data):
+        return yacc.parse(data)
+
+    def t_CAPABILITY(self, t):
+        r'[+-]CAP_[A-Z_]*'
+        return t
+
+    def t_PAX_FLAG(self, t):
+        r'[+-]PAX_[A-Z_]*'
+        return t
+
+    def t_RESOURCE(self, t):
+        r'RES_[A-Z]*'
+        return t
+
+    def t_COMMENT(self, t):
+        r'\#.*'
+        pass
+        # No return value. Token discarded
+
+    def t_ID(self, t):
+        r'[a-zA-Z_][a-zA-Z_0-9-]*'
+        t.type = self.reserved.get(t.value, 'ID') # Check for reserved words
+        return t
+
+    def t_newline(self, t):
+        r'\n+'
+        t.lexer.lineno += t.value.count("\n")
+
+    def t_error(self, t):
+        die("Illegal character {} at line {}".format(t.value[0] , t.lexer.lineno))
+        t.lexer.skip(1)
+
+    def p_error(self, p):
+        die("Syntax error at token '" + str(p.type) + "', value: '" + str(p.value) + "' line: " + str(p.lineno))
+        #print "Syntax error at token", p.type, p.value, "line",p.lineno
+        # Just discard the token and tell the parser it's okay.
+        yacc.errok()
+
+    def p_policy(self, p):
+        '''policy : role_definition policy
+                  | role_definition'''
+
+        p[0] = Policy([p[1]])
+        if len(p) > 2:
+            p[0].roles += p[2].roles
+
+    def p_empty(self, p):
+        'empty :'
+
+        p[0] = ''
+
+    def p_ids(self, p):
+        '''ids : ID ids
+               | ID'''
+
+        p[0] = {p[1]}
+        if len(p) == 3:
+            p[0] |= p[2]
+
+    def p_oid(self, p):
+        '''oid : ID
+               | empty'''
+
+        p[0] = set(o for o in p[1])
+
+    def p_role_definition(self, p):
+        '''role_definition : ROLE ID oid role_attributes subject_definitions
+                           | DOMAIN ID oid ids role_attributes subject_definitions'''
+
+        role_transitions = set()
+        if p[1] == 'role':
+            for attribute in p[4]:
+                if len(attribute) and attribute[0] == 'role_transitions':
+                    role_transitions |= attribute[1]
+            p[0] = Role(name = p[2], flags = p[3], role_transitions = role_transitions,
+                        subjects = p[5])
+        else:
+            for attribute in p[5]:
+                if len(attribute) and attribute[0] == 'role_transitions':
+                    role_transitions |= attribute[1]
+            p[0] = Role(name = p[2], flags = p[3], role_transitions = role_transitions,
+                        subjects = p[6], ids = p[4])
+
+    def p_role_attributes(self, p):
+        '''role_attributes : role_attribute role_attributes
+                           | empty'''
+
+        p[0] = [p[1]]
+        if len(p) == 3:
+            p[0] += p[2]
+
+    def p_role_attribute(self, p):
+        '''role_attribute : ROLE_TRANSITIONS ids
+                          | ROLE_ALLOW_IP IP_ADDRESS ip_netmask
+                          | ROLE_UMASK UMASK'''
+
+        p[0] = (p[1], p[2])
+
+    def p_subject_definitions(self, p):
+        '''subject_definitions : subject_definition subject_definitions
+                               | subject_definition'''
+
+        p[0] = [p[1]]
+        if len(p) == 3:
+            p[0] += p[2]
+
+    def p_subject_definition(self, p):
+        '''subject_definition : SUBJECT subject_paths oid subject_attributes file_definitions definitions'''
+
+        user_transition_allow = set()
+        user_transition_deny = set()
+        group_transition_allow = set()
+        group_transition_deny = set()
+        caps = []
+
+        subject_attributes = p[4]
+        objects = p[5]
+        definitions = p[6]
+
+        for attribute in subject_attributes:
+            if len(attribute):
+                if attribute[0] == 'user_transition_allow':
+                    user_transition_allow |= attribute[1]
+                elif attribute[0] == 'user_transition_deny':
+                    user_transition_deny |= attribute[1]
+                elif attribute[0] == 'group_transition_allow':
+                    group_transition_allow |= attribute[1]
+                elif attribute[0] == 'group_transition_deny':
+                    group_transition_deny |= attribute[1]
+
+        if len(user_transition_allow) and len(user_transition_deny):
+            logging.error("user_transition_allow and user_transition_deny cannot be used together.")
+            sys.exit(1)
+        if len(group_transition_allow) and len(group_transition_deny):
+            logging.error("group_transition_allow and group_transition_deny cannot be used together.")
+            sys.exit(1)
+
+        caps = [d for d in definitions if d.startswith('-CAP_') or d.startswith('+CAP_')]
+
+        p[0] = Subject(paths = p[2], modes = p[3],
+                       user_transition_allow = user_transition_allow,
+                       user_transition_deny = user_transition_deny,
+                       group_transition_allow = group_transition_allow,
+                       group_transition_deny = group_transition_deny,
+                       objects = objects,
+                       caps = caps)
+
+    def p_subject_attributes(self, p):
+        '''subject_attributes : subject_attribute subject_attributes
+                              | empty'''
+
+        p[0] = [p[1]]
+        if len(p) == 3:
+            p[0] += p[2]
+
+    def p_subject_attribute(self, p):
+        '''subject_attribute : USER_TRANSITION_ALLOW ids
+                             | USER_TRANSITION_DENY ids
+                             | GROUP_TRANSITION_ALLOW ids
+                             | GROUP_TRANSITION_DENY ids
+                             | IP_OVERRIDE IP_ADDRESS'''
+
+        p[0] = (p[1], p[2])
+
+    def p_subject_paths(self, p):
+        '''subject_paths : subject_path ':' subject_paths
+                         | subject_path'''
+
+        if len(p) > 2:
+            die("Nested path are not supported at the moment, aborting")
+        p[0] = Path(p[1])
+
+    def p_subject_path(self, p):
+        '''subject_path : OPATH '''
+
+        p[0] = p[1]
+
+    # I use subject_path but we need to add wildcards!
+    def p_file_definitions(self, p):
+        '''file_definitions : file_definition file_definitions
+                            | empty'''
+
+        if len(p) == 2:
+            p[0] = []
+        else:
+            p[0] = [p[1]] + p[2]
+
+    def p_file_definition(self, p):
+        '''file_definition : OPATH oid'''
+
+        p[0] = Obj(path = Path(p[1]), modes = p[2])
+
+    def p_definitions(self, p):
+        '''definitions : CAPABILITY definitions
+                       | resource_definition definitions
+                       | pax_flag_definition definitions
+                       | ip_acl_definition definitions
+                       | empty'''
+
+        if len(p) == 2:
+            p[0] = []
+        elif p[1]:
+            p[0] = [p[1]] + p[2]
+        else:
+            p[0] = p[2]
+
+    def p_resource_definition(self, p):
+        '''resource_definition : RESOURCE LIMIT LIMIT'''
+
+        pass
+
+    def p_pax_flag_definition(self, p):
+        '''pax_flag_definition : PAX_FLAG'''
+
+        pass
+
+    def p_ip_acl_definition(self, p):
+        '''ip_acl_definition : CONNECT DISABLED
+                             | BIND DISABLED
+                             | CONNECT ip_acl_address
+                             | BIND ip_acl_address
+                             | SOCK_ALLOW_FAMILY ids'''
+
+        pass
+
+    def p_url(self, p):
+        '''url : ID '.' url
+               | ID'''
+
+        pass
+
+    def p_ip_acl_address(self, p):
+        '''ip_acl_address : IP_ADDRESS ip_netmask port ids
+                          | url port ids'''
+
+        pass
+
+    def p_ip_netmask(self, p):
+        '''ip_netmask : OPATH
+                      | empty'''
+
+        pass
+
+    def p_port(self, p):
+        '''port : PORT
+                | empty'''
+
+        pass
+
+def preprocess_policy(p):
+    '''Pre-process the policy before parsing.'''
+
+    # FIXME: regexp fails if there's a comment containing '}' in a define block
+    define = re.compile("^\s*define\s+(\w+)\s+{(.*?)}", flags = re.DOTALL | re.MULTILINE)
+    replace = re.compile("^\s*replace\s+(\w+)\s+(\S+)", flags = re.MULTILINE)
+
+    # purge comments
+    p = re.sub("#.*", "", p)
+    # purge replace statements
+    for r in replace.findall(p):
+        p = p.replace("$("+r[0]+")", r[1])
+    p = replace.sub("", p)
+    # purge define blocks
+    for d in define.findall(p):
+        p = p.replace("$"+d[0], d[1])
+    p = define.sub("", p)
+    # purge braces
+    p = re.sub("{|}", "", p)
+    # FIXME: temporary hack to purge all connect and bind rules before parsing
+    p = re.sub("^(\s*)(connect|bind)(.+)", "", p, flags = re.MULTILINE)
+    # FIXME: temporay hack to purge role_allow_ip rules
+    #p = re.sub("^\s*role_allow_ip.*", "", p, flags = re.MULTILINE)
+
+    return p
+
+def get_policy(fname, realroot):
+    policy = ""
+
+    include = re.compile("\s*include\s+<(.*?)>")
+    fname = os.path.abspath(fname)
+    # it's a dir, we need to parse all the files inside
+    if os.path.isdir(fname):
+        # ignore hidden files
+        for fname_new in glob.glob(os.path.join(fname, '*')):
+            policy += get_policy(os.path.join(fname, fname_new), realroot)
+    # it's a single file, parse it and resolve include directives
+    else:
+        try:
+            f = open(fname, 'r')
+        except IOError:
+            die("Unable to open file {} for reading, aborting.".format(fname))
+        for line in f:
+            m = include.match(line)
+            if m:
+                # strip '/etc/grsec' out from the path and put current dirname
+                fname_new = os.path.join(realroot, os.path.abspath(m.group(1))[11:])
+                policy += get_policy(fname_new, realroot)
+            else:
+                policy += line
+        f.close()
+
+    return policy
+
+def parse_options():
+    '''Parse the command line options provided to the program and initialize
+    the global variable args.'''
+
+    global args
+
+    opt_parser = argparse.ArgumentParser(
+        description='a security analyser for Grsecurity RBAC policies.')
+    # say "thank you" to argparse devs for this incredibly shitty line. This is
+    # needed to parse arguments starting with the minus sign, e.g.
+    # --protected-paths '-/etc/ppp'. See http://bugs.python.org/issue9334
+    opt_parser._negative_number_matcher = re.compile(r'^-.+$')
+
+    opt_parser.add_argument('policy', nargs = '?',
+        help = 'policy file to be analyzed')
+    opt_parser.add_argument('-A', '--admin',
+        action = 'store_true',
+        help = ('include administrative special roles in the analysis '
+                '(default: false)'),
+        default = False)
+    opt_parser.add_argument('-a', '--auth',
+        action = 'store_true',
+        help = ('include transitions to special roles that require explicite '
+                'authentication (default: false)'),
+        default = False)
+    opt_parser.add_argument('-fs',
+        choices = ['none', 'all', 'scan'],
+        help = ('set the desired type of interaction with the underlying '
+                'filesystem.'
+                '"none": assume there are no setuid/setgid files; '
+                '"all": all files could be setuid/setgid and owned by every '
+                'possible user/group combination; '
+                '"scan": perform a dynamic analysis of the filesystem to detect the '
+                'actual set of setuid/setgid files (default: "none")'),
+        default = 'none')
+    opt_parser.add_argument('-lp',
+        help = 'path of a precomputed Policy object to load')
+    opt_parser.add_argument('-lf',
+        help = 'path of a precomputed Filesystem object to load')
+    opt_parser.add_argument('-dp',
+        help = 'path to which the Policy object will be saved')
+    opt_parser.add_argument('-df',
+        help = 'path to which the Filesystem object will be saved')
+    opt_parser.add_argument('-r', '--rules', nargs='*', default = [],
+        help = 'set of security invariants the policy should satisfy')
+    opt_parser.add_argument('-t', '--traces',
+        action = 'store_true',
+        help = ('show execution traces'))
+    opt_parser.add_argument('-pt', '--transitions',
+        action = 'store_true',
+        help = ('show transitions from LOW to HIGH states whilst performing the '
+                'automatic analysis'))
+
+    opt_parser.add_argument('--protected-paths', default = '',
+        help = ('list of highly sensitive paths that should be protected from '
+                'untrusted access. The synatx used to specify paths is '
+                'reminiscent of gentoo USE flags declaration. Remove a path from '
+                'the set of hardcoded protected paths by prefixing the path with '
+                'the minus-sign or just add extra paths, e.g. "-/etc/ppp '
+                '/etc/nginx". To clear the set of stored paths use "-*"'))
+    opt_parser.add_argument('--trusted-apps', default = '',
+        help = ('specify the list of trusted apps using the same syntax as '
+                'described above'))
+    opt_parser.add_argument('--learnfile',
+        help = ('parse the learn_config file in order to populate the list of '
+                'protected paths with the resources specified as '
+                'high-protected-path'))
+    opt_parser.add_argument('--fullstart',
+        action = 'store_true',
+        help = ('assume the full set of starting states as entrypoints when '
+                'verifying the provided rules. This is usually not needed '
+                'besides of special roles'))
+    opt_parser.add_argument('-v', '--verbosity', action = 'count',
+        help = 'print a detailed output for diagnostic purposes')
+    opt_parser.add_argument('-V', '--version', action = 'version', 
+        version = 'granalyze-{}'.format(__version__))
+
+    args = opt_parser.parse_args()
+
+def die(message):
+    '''Print a message and exit on fatal errors.'''
+
+    sys.stderr.write("[!] {}\n".format(message))
+    sys.exit(1)
+
+def notice(message):
+    '''Print an informative message.'''
+
+    print("[*] {}".format(message))
+
+def warn(message):
+    '''Print a warning message.'''
+
+    print("[~] {}".format(message))
+
+def load_pickle(pathname):
+    '''Load a pickle dump given a path and return the loaded object.'''
+
+    logging.info("Loading pickle dump '{}'".format(pathname))
+    try:
+        with open(pathname, 'r') as f:
+            return pickle.load(f)
+    except IOError:
+        die("unable to open {} for reading".format(pathname))
+    except pickle.PickleError:
+        die("unable to load the pickle dump from {}".format(pathname))
+
+def dump_pickle(pathname, instance):
+    '''Save a given instance as a pickle dump.'''
+
+    logging.info("Saving a pickle dump into '{}'".format(pathname))
+    try:
+        with open(pathname, 'w') as f:
+            pickle.dump(instance, f)
+    except IOError:
+        die("unable to open {} for writing".format(pathname))
+    except pickle.PickleError:
+        die("unable to dump the object instance to {}".format(pathname))
+
+def parse_paths(paths, new_paths):
+    '''Return a modified version of the paths set having all its elements as
+    Path instances by adding/removing paths as specified in the new_paths
+    string.'''
+
+    assert type(paths) is set
+    assert type(new_paths) is str
+    
+    for path in new_paths.split():
+        if path == "-*":
+            paths.clear()
+        elif path.startswith('-'):
+            paths.discard(path[1:])
+        else:
+            paths.add(path)
+
+    return {Path(p) for p in paths} 
+
+def main():
+    global policy
+    global filesystem
+    global protected_paths
+    global trusted_apps
+
+    parse_options()
+
+    # set logging
+    if args.verbosity >= 2:
+        log_level = logging.DEBUG
+    elif args.verbosity >= 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    logging.basicConfig(format='--%(levelname)s-- %(message)s',
+                        level = log_level)
+
+    # check whether pre-computed objects are provided or not
+    if args.lp:
+        policy = load_pickle(args.lp)
+    if args.lf:
+        filesystem = load_pickle(args.lf)
+    if (not policy) and (not args.policy):
+        die("please provide a policy file to analyze")
+    if args.fs == 'scan' and (not filesystem):
+        notice("Inspecting the filesystem for set-uid/set-gid files (this may take some time).")
+        filesystem = Filesystem()
+        notice("Filesystem scan completed.")
+    if not policy:
+        logging.info("Preprocessing the policy file")
+        # get policy and preprocess it
+        policy_file =  os.path.abspath(args.policy)
+        policy_contents = preprocess_policy(get_policy(policy_file, os.path.dirname(policy_file)))
+        logging.info("Parsing the policy contents")
+        # parse the processed policy contents
+        parser = Parser(debug = args.verbosity >= 2)
+        # retrieve the policy AST
+        policy = parser(policy_contents)
+        logging.info("Computing relations")
+        # compute the relations
+        policy.compute_relations()
+        logging.info("Expanding objects by inheritance")
+        # compute inheritance
+        policy.compute_inheritance()
+        # compute the interplay of the filesystem with respect to the policy
+        if filesystem:
+            logging.info("Computing the filesystem abstraction")
+            policy.compute_fs_abstraction()
+        logging.info("Computing the abstract LTS")
+        # compute the abstract lts
+        policy.compute_lts()
+        # compute all possible transitions
+        policy.compute_closure()
+    # printing info about the processed policy
+    notice("Number of roles: {}".format(len(policy.roles)))
+    notice("Number of states: {}".format(len(policy.lts)))
+    notice("Number of transitions after closure: {}".format(sum(sum(x) for x in policy.closure)))
+    # dump objects to file for later analysis
+    if args.dp:
+        dump_pickle(args.dp, policy)
+    if args.df:
+        dump_pickle(args.df, filesystem)
+    # check rules, if any
+    rules = []
+    for rule in args.rules:
+        rules.append(Rule(rule))
+    for rule in rules:
+        notice("Verifying rule '{}'".format(rule))
+        try:
+            rule.verify()
+        except Rule.InvalidRule:
+            logging.error("Invalid rule, skipping".format(rule))
+    if not args.rules:
+        if args.learnfile:
+            try:
+                f = open(args.learnfile)
+                protected_paths = set(re.findall("^\s*high-protected-path\s+(\S+)",
+                                                 f.read(), flags = re.MULTILINE))
+            except IOError:
+                die("Unable to open file {} for reading, aborting.".format(args.learnfile))
+        protected_paths = parse_paths(protected_paths, args.protected_paths)
+        trusted_apps = parse_paths(trusted_apps, args.trusted_apps)
+        logging.info("Protected paths: {}".format(' '.join(str(p) for p in protected_paths)))
+        logging.info("Trusted Apps: {}".format(' '.join(str(p) for p in trusted_apps)))
+        policy.automatic_analysis(show_transitions = args.transitions)
+        
+if __name__ == "__main__":
+    main()
